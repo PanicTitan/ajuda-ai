@@ -1,0 +1,1136 @@
+// Version before citation token saver
+
+/**
+ * @file src/services/geminiService.ts
+ * @description Singleton Gemini client and all API logic for Ajuda Ai.
+ * 
+ * STRATEGY OVERVIEW:
+ * 1. Gemini Filters Handling:
+ *    - We use custom safety settings (HarmBlockThreshold.BLOCK_NONE) where possible.
+ *    - When a RECITATION or SAFETY block occurs, we catch the error and retry with a modified prompt
+ *      that explicitly asks for paraphrasing and avoiding verbatim copies.
+ * 
+ * 2. Creative Mode (Multi-step Reasoning):
+ *    - Phase 1: Free-form generation with tools (Google Search, URL Context). This allows the model
+ *      to think and research without being constrained by a strict JSON schema initially.
+ *    - Phase 2: Structured Extraction. A second pass takes the raw text from Phase 1 and extracts
+ *      the data into a strict JSON schema (no tools allowed here to ensure schema adherence).
+ *    - Phase 3: Programmatic Verification. We check for structural errors (missing fields, wrong types)
+ *      and question counts. If issues are found, we loop back to Phase 1 with specific feedback.
+ * 
+ * 3. Model Downgrade:
+ *    - If a quota error (429/RESOURCE_EXHAUSTED) occurs, we automatically cycle through a hierarchy:
+ *      Pro -> Flash -> Flash Lite.
+ * 
+ * 4. Network Resilience:
+ *    - Automatic waiting for internet reconnection and exponential backoff retries.
+ */
+
+import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from '@google/genai';
+import { jsonrepair } from 'jsonrepair';
+import { z } from 'zod';
+import { AppSettings, Asset, WarmContext, Answer, WarmContextSchema } from '@/services/dexieService';
+
+/**
+ * Global state for network management.
+ */
+let isWaitingForNetwork = false;
+let networkQueue: (() => void)[] = [];
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('online', () => {
+    if (isWaitingForNetwork || networkQueue.length > 0) {
+      console.log('[Network] Back online! Resuming queued requests...');
+      isWaitingForNetwork = false;
+      networkQueue.forEach((resolve, index) => {
+        setTimeout(resolve, Math.random() * 1000 + (index * 1500));
+      });
+      networkQueue = [];
+    }
+  });
+}
+
+/**
+ * Helper to wait for internet connection before proceeding with an API call.
+ * @param {boolean} [forceWaitEvent=false] - Whether to force waiting for the online event.
+ * @returns {Promise<void>}
+ */
+async function waitForInternet(forceWaitEvent = false): Promise<void> {
+  if (typeof navigator !== 'undefined' && (!navigator.onLine || forceWaitEvent)) {
+    console.log('[Network] Offline or waiting for reconnection event...');
+    isWaitingForNetwork = true;
+    await new Promise<void>((resolve) => {
+      networkQueue.push(resolve);
+    });
+  }
+}
+
+// ============================================================================
+// Schemas for Gemini API
+// ============================================================================
+
+const warmContextSchema = (z as any).toJSONSchema(WarmContextSchema, { target: "openapi-3.0" });
+
+const AiAnswerSchema = z.object({
+  questionNumber: z.number().optional().describe('The sequential number of the question if visible (e.g., 1, 2, 3). If not visible, infer the logical order.'),
+  type: z.string().describe('The type of the question. Must be one of: multiple_choice, writing, math, draw'),
+  language: z.string().describe('The ISO language code of the answer, strictly matching the question language (e.g., "pt-BR", "en").'),
+  question: z.string().describe('The full, verbatim text of the question extracted directly from the source.'),
+  
+  multipleChoiceAnswer: z.object({
+    correctOption: z.string().describe('The letter of the correct option (e.g., A, B, C, D).'),
+    correctOptionText: z.string().optional().describe('The full text content of the correct option.'),
+    explanation: z.string().describe('Detailed reasoning explaining why this option is correct and others are wrong.')
+  }).optional().describe('MANDATORY if type is "multiple_choice". DO NOT use for other types.'),
+  
+  writingAnswer: z.object({
+    shortAnswer: z.string().describe('A concise, direct answer to the prompt (1-2 sentences).'),
+    detailedAnswer: z.string().describe('A comprehensive, elaborated response or essay for the prompt.')
+  }).optional().describe('MANDATORY if type is "writing". DO NOT use for other types.'),
+  
+  mathAnswer: z.object({
+    finalAnswer: z.string().describe('The final numerical or symbolic result of the calculation.'),
+    solutionSteps: z.array(z.string()).describe('An array of strings, each representing a single step in the logical or mathematical process.')
+  }).optional().describe('MANDATORY if type is "math". DO NOT use for other types.'),
+  
+  drawAnswer: z.object({
+    asciiArt: z.string().describe('A text-based (ASCII) representation of the required diagram or drawing.'),
+    explanation: z.string().optional().describe('An explanation of the drawing or diagram.')
+  }).optional().describe('MANDATORY if type is "draw". DO NOT use for other types.')
+});
+
+const solveSchema = (z as any).toJSONSchema(z.object({
+  totalQuestions: z.number().describe('The exact count of questions found in the provided material. This MUST equal the length of the "answers" array.'),
+  answers: z.array(AiAnswerSchema).describe("An array containing the answer for EVERY SINGLE QUESTION found in the input. You MUST return an item for each question.")
+}), { target: "openapi-3.0" });
+console.log('[GeminiService] solveSchema:', JSON.stringify(solveSchema, null, 2));
+
+const AiVerificationSchema = z.object({
+  question: z.string().describe('The exact question text from the initial answers to identify which answer you are verifying. If this is a NEW question not in the initial answers, put the new question text here.'),
+  ok: z.boolean().describe('Set to true ONLY if the initial answer is completely correct and requires NO changes. Set to false if it needs correction, or if this is a newly discovered question.'),
+  correctedAnswer: AiAnswerSchema.optional().describe('If ok is false, provide the FULL, corrected answer object here. If ok is true, omit this field.')
+});
+
+const verifySchema = (z as any).toJSONSchema(z.object({
+  totalQuestions: z.number().describe('The exact count of questions found in the provided material. This MUST equal the length of the "verifications" array.'),
+  verifications: z.array(AiVerificationSchema).describe("An array containing the verification result for EVERY question. You MUST return an item for each question, whether it was in the initial answers or newly discovered.")
+}), { target: "openapi-3.0" });
+
+// ============================================================================
+// Helper Functions for Mapping
+// ============================================================================
+
+function generateId(text: string): string {
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    const char = text.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash |= 0;
+  }
+  return `q_${Math.abs(hash)}_${Date.now().toString(36)}`;
+}
+
+function mapDbAnswerToAiAnswer(dbAnswer: Answer): any {
+  const base = {
+    questionNumber: dbAnswer.questionNumber,
+    type: dbAnswer.type,
+    language: dbAnswer.language,
+    question: dbAnswer.question
+  };
+  
+  if (dbAnswer.type === 'multiple_choice') {
+    return { ...base, multipleChoiceAnswer: dbAnswer.multipleChoiceAnswer };
+  }
+  if (dbAnswer.type === 'writing') {
+    return { ...base, writingAnswer: dbAnswer.writingAnswer };
+  }
+  if (dbAnswer.type === 'math') {
+    return { ...base, mathAnswer: dbAnswer.mathAnswer };
+  }
+  if (dbAnswer.type === 'draw') {
+    return { ...base, drawAnswer: dbAnswer.drawAnswer };
+  }
+  return base;
+}
+
+function mapAiAnswerToDbAnswer(aiAnswer: any): Answer {
+  // console.log('[GeminiService] mapAiAnswerToDbAnswer received:', JSON.stringify(aiAnswer, null, 2));
+  const base = {
+    id: generateId(aiAnswer.question || ''),
+    questionNumber: aiAnswer.questionNumber,
+    type: aiAnswer.type || 'writing', // Default to writing if type is missing during streaming
+    language: aiAnswer.language || 'pt-BR',
+    question: aiAnswer.question || '',
+    doubleChecked: false,
+    meta: {}
+  };
+
+  if (aiAnswer.type === 'multiple_choice') {
+    const mc = aiAnswer.multipleChoiceAnswer || {};
+    const wr = aiAnswer.writingAnswer || {};
+    
+    let correctOption = mc.correctOption || '';
+    let correctOptionText = mc.correctOptionText || '';
+    let explanation = mc.explanation || '';
+
+    // Fallback if AI hallucinated and put the answer in writingAnswer
+    if (!correctOption && !explanation && (wr.shortAnswer || wr.detailedAnswer)) {
+      // Try to extract a single letter from shortAnswer (e.g., "A.", "b)", "'c'")
+      const match = wr.shortAnswer?.match(/^([a-eA-E])[\.\-\)]?\s/i) || wr.shortAnswer?.match(/['"]([a-eA-E])['"]/i);
+      if (match) {
+        correctOption = match[1].toLowerCase();
+        explanation = wr.detailedAnswer || wr.shortAnswer || '';
+      } else {
+        // No clear letter found. Put everything in explanation.
+        explanation = [wr.shortAnswer, wr.detailedAnswer].filter(Boolean).join('\n\n');
+      }
+    }
+
+    // CRITICAL FIX: Ensure correctOption is just a short string (max 5 chars) to prevent UI breakage
+    if (correctOption.length > 5) {
+      explanation = correctOption + '\n\n' + explanation;
+      correctOption = '';
+    }
+
+    return {
+      ...base,
+      type: 'multiple_choice',
+      multipleChoiceAnswer: {
+        correctOption,
+        correctOptionText,
+        explanation
+      }
+    } as any;
+  }
+  if (aiAnswer.type === 'writing') {
+    const wr = aiAnswer.writingAnswer || {};
+    const mc = aiAnswer.multipleChoiceAnswer || {};
+    return {
+      ...base,
+      type: 'writing',
+      writingAnswer: {
+        shortAnswer: wr.shortAnswer || mc.correctOption || '',
+        detailedAnswer: wr.detailedAnswer || mc.explanation || ''
+      }
+    } as any;
+  }
+  if (aiAnswer.type === 'math') {
+    const ma = aiAnswer.mathAnswer || aiAnswer.writingAnswer || {};
+    return {
+      ...base,
+      type: 'math',
+      mathAnswer: {
+        finalAnswer: ma.finalAnswer || ma.shortAnswer || '',
+        solutionSteps: ma.solutionSteps || (ma.detailedAnswer ? [ma.detailedAnswer] : [])
+      }
+    } as any;
+  }
+  if (aiAnswer.type === 'draw') {
+    const dr = aiAnswer.drawAnswer || aiAnswer.writingAnswer || {};
+    return {
+      ...base,
+      type: 'draw',
+      drawAnswer: {
+        asciiArt: dr.asciiArt || dr.detailedAnswer || '',
+        explanation: dr.explanation || ''
+      },
+      generatedImageBase64: null
+    } as any;
+  }
+
+  // Fallback for unknown types during streaming
+  return {
+    ...base,
+    type: 'writing',
+    writingAnswer: {
+      shortAnswer: '',
+      detailedAnswer: ''
+    }
+  } as any;
+}
+
+// ============================================================================
+// Service Class
+// ============================================================================
+
+
+// Define as categorias que deseja "desativar"
+const safetySettings = [
+  // @ts-ignore
+  {
+    category: HarmCategory.HARM_CATEGORY_UNSPECIFIED,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+  // @ts-ignore
+  {
+    category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+  // @ts-ignore
+  {
+    category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+  // @ts-ignore
+  {
+    category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+  // @ts-ignore
+  {
+    category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+  // @ts-ignore
+  {
+    category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+  // @ts-ignore
+  {
+    category: 'HARM_CATEGORY_JAILBREAK', // Using string to bypass TS enum check if not present
+    threshold: HarmBlockThreshold.BLOCK_NONE,
+  },
+];
+
+class GeminiService {
+  private getClient(apiKey: string) {
+    const customKey = apiKey?.trim();
+    const keyToUse = customKey || process.env.GEMINI_API_KEY;
+    
+    if (!keyToUse) throw new Error("API Key is required.");
+    
+    if (customKey) {
+      console.log(`[GeminiService] Using custom API key (ends with ...${customKey.slice(-4)})`);
+    } else {
+      console.log(`[GeminiService] Using default environment API key`);
+    }
+    
+    return new GoogleGenAI({ apiKey: keyToUse });
+  }
+
+  private getModelHierarchy(startModel: string): string[] {
+    const hierarchy = [
+      'gemini-3.1-pro-preview',
+      'gemini-3-flash-preview',
+      'gemini-3.1-flash-lite-preview'
+    ];
+    
+    const startIndex = hierarchy.indexOf(startModel);
+    if (startIndex === -1) return [startModel];
+    
+    return hierarchy.slice(startIndex);
+  }
+
+  private buildPartsFromAssets(assets: Asset[]) {
+    return assets.map(asset => {
+      if (asset.mimeType === 'application/pdf' || asset.mimeType.startsWith('image/') || asset.mimeType.startsWith('audio/')) {
+        return {
+          inlineData: {
+            data: asset.base64Data,
+            mimeType: asset.mimeType,
+          }
+        };
+      }
+
+      // Decode base64 for text-based assets
+      let textContent = asset.base64Data;
+      try {
+        // Robust UTF-8 base64 decoding
+        textContent = decodeURIComponent(Array.prototype.map.call(atob(asset.base64Data), function(c: any) {
+          return '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2);
+        }).join(''));
+      } catch (e) {
+        try {
+          textContent = atob(asset.base64Data);
+        } catch (e2) {
+          textContent = asset.base64Data;
+        }
+      }
+
+      if (asset.mimeType === 'text/uri-list' || asset.name.includes('youtube.com') || asset.name.includes('youtu.be')) {
+        return { text: `Video URL: ${textContent}` };
+      }
+      return { text: textContent };
+    });
+  }
+
+  async countTokens(assets: Asset[], settings: AppSettings): Promise<number> {
+    const ai = this.getClient(settings.apiKey);
+    const parts = this.buildPartsFromAssets(assets);
+    if (parts.length === 0) return 0;
+    try {
+      const response = await ai.models.countTokens({
+        model: settings.model,
+        contents: { parts }
+      });
+      return response.totalTokens || 0;
+    } catch (err) {
+      console.error('Failed to count tokens', err);
+      return 0;
+    }
+  }
+
+  async *warmAnalysis(assets: Asset[], settings: AppSettings): AsyncGenerator<Partial<WarmContext>> {
+    const ai = this.getClient(settings.apiKey);
+    const parts = this.buildPartsFromAssets(assets);
+    
+    parts.unshift({ text: "Analyze the following study materials and provide a comprehensive preparation package. Extract key concepts, formulas, vocabulary, and predict question types. Make the summary detailed and comprehensive." });
+
+    const modelsToTry = settings.enableModelDowngrade ? this.getModelHierarchy(settings.model) : [settings.model];
+    let finalContext: Partial<WarmContext> = {};
+    let lastError: any = null;
+
+    for (const currentModel of modelsToTry) {
+      console.log(`[GeminiService] warmAnalysis trying model: ${currentModel}`);
+      let isComplete = false;
+      let attempt = 0;
+      const maxRetries = 5;
+      let quotaExceeded = false;
+
+      while (!isComplete) {
+        await waitForInternet();
+        try {
+          const responseStream = await ai.models.generateContentStream({
+            model: currentModel,
+            contents: { parts },
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: warmContextSchema,
+              thinkingConfig: { thinkingBudget: settings.thinkingBudget },
+            },
+            // @ts-ignore
+            safetySettings
+          });
+
+          let fullText = "";
+          for await (const chunk of responseStream) {
+            if (chunk.text) {
+              fullText += chunk.text;
+              try {
+                const repaired = jsonrepair(fullText);
+                const parsed = JSON.parse(repaired);
+                finalContext = parsed;
+                yield parsed as Partial<WarmContext>;
+              } catch (e) {
+                // Ignore parse errors during streaming
+              }
+            }
+          }
+          isComplete = true;
+        } catch (err: any) {
+          lastError = err;
+          const isQuotaError = err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED');
+          
+          if (isQuotaError && settings.enableModelDowngrade && currentModel !== modelsToTry[modelsToTry.length - 1]) {
+            console.warn(`[GeminiService] Quota exceeded for ${currentModel}. Downgrading...`);
+            quotaExceeded = true;
+            break;
+          }
+
+          attempt++;
+          console.warn(`[Network] warmAnalysis attempt ${attempt} failed for ${currentModel}.`, err);
+          
+          if (attempt <= maxRetries) {
+            const delay = attempt * 5000;
+            await new Promise(resolve => setTimeout(resolve, delay));
+          } else if (attempt === maxRetries + 1) {
+            console.log('[Network] Max retries reached. Waiting for explicit network reconnection...');
+            await waitForInternet(true);
+          } else {
+            // If we are downgrading, we might want to try the next model even if retries failed
+            if (settings.enableModelDowngrade && currentModel !== modelsToTry[modelsToTry.length - 1]) {
+              quotaExceeded = true;
+              break;
+            }
+            throw err;
+          }
+        }
+      }
+
+      if (!quotaExceeded && isComplete) {
+        // Successfully finished with this model
+        break;
+      }
+      
+      if (currentModel === modelsToTry[modelsToTry.length - 1] && !isComplete) {
+        throw lastError;
+      }
+    }
+
+    if (settings.generateImageInPreparation && finalContext.summary) {
+      try {
+        const imagePrompt = `Create an infographic or visual summary for the following study material:\n\n${finalContext.summary.substring(0, 1000)}\n\nKey Concepts: ${finalContext.keyConcepts?.join(', ')}`;
+        const imageResponse = await ai.models.generateImages({
+          model: settings.imageGenModel,
+          prompt: imagePrompt,
+          config: {
+            numberOfImages: 1,
+            outputMimeType: "image/jpeg",
+          },
+        });
+        
+        if (imageResponse.generatedImages && imageResponse.generatedImages.length > 0) {
+          const firstImage = imageResponse.generatedImages[0];
+          if (firstImage && firstImage.image) {
+            finalContext.imageBase64 = firstImage.image.imageBytes;
+            yield finalContext;
+          }
+        }
+      } catch (err) {
+        console.error('[GeminiService] Failed to generate image in preparation:', err);
+      }
+    }
+  }
+
+  /**
+   * Streams structured answers from the AI, parsing JSON chunks as they arrive.
+   * @param ai The GoogleGenAI client instance.
+   * @param parts The content parts to send to the AI.
+   * @param settings The application settings.
+   * @param model The specific model to use for this call.
+   * @returns An async generator yielding the parsed answers and the total questions count.
+   */
+  private async *streamStructuredAnswers(ai: any, parts: any[], settings: AppSettings, model: string): AsyncGenerator<{ answers: Partial<Answer>[], totalQuestions: number }> {
+    let isComplete = false;
+    let attempt = 0;
+    const maxRetries = 5;
+
+    while (!isComplete) {
+      await waitForInternet();
+      try {
+        const responseStream = await ai.models.generateContentStream({
+          model: model,
+          contents: { parts },
+          config: {
+            responseMimeType: "application/json",
+            responseSchema: solveSchema,
+            // NO TOOLS HERE as requested for structured output
+            thinkingConfig: { thinkingBudget: settings.thinkingBudget },
+          },
+          // @ts-ignore
+          safetySettings
+        });
+
+        let fullText = "";
+        let lastYieldTime = 0;
+        for await (const chunk of responseStream) {
+          if (chunk.text) {
+            fullText += chunk.text;
+            const now = Date.now();
+            if (now - lastYieldTime > 500) { // Throttle parsing to every 500ms
+              try {
+                let cleanedText = fullText;
+                if (settings.recitationHandlingMode === 'token_injection') {
+                  cleanedText = cleanedText.replace(/@_@/g, '');
+                }
+                const repaired = jsonrepair(cleanedText);
+                const parsed = JSON.parse(repaired);
+                if (parsed && Array.isArray(parsed.answers)) {
+                  yield { answers: parsed.answers.map(mapAiAnswerToDbAnswer), totalQuestions: parsed.totalQuestions || 0 };
+                  lastYieldTime = now;
+                }
+              } catch (e) {
+                // Ignore parse errors during streaming
+              }
+            }
+          }
+        }
+        // Final parse to ensure we get the complete result
+        try {
+          console.log('[GeminiService] streamStructuredAnswers final raw text:', fullText);
+          let cleanedText = fullText;
+          if (settings.recitationHandlingMode === 'token_injection') {
+            cleanedText = cleanedText.replace(/@_@/g, '');
+            console.log('[GeminiService] streamStructuredAnswers text after token stripping:', cleanedText);
+          }
+          const repaired = jsonrepair(cleanedText);
+          const parsed = JSON.parse(repaired);
+          console.log('[GeminiService] streamStructuredAnswers final parsed JSON:', JSON.stringify(parsed, null, 2));
+          if (parsed && Array.isArray(parsed.answers)) {
+            yield { answers: parsed.answers.map(mapAiAnswerToDbAnswer), totalQuestions: parsed.totalQuestions || 0 };
+          }
+        } catch (e) {
+          console.error('[GeminiService] streamStructuredAnswers final parse error:', e);
+        }
+        
+        isComplete = true;
+      } catch (err: any) {
+        if (err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED')) {
+          throw err;
+        }
+        
+        // Handle stream-specific safety/recitation errors if they bubble up
+        if (err.message?.includes('RECITATION')) {
+           console.warn(`[GeminiService] streamStructuredAnswers blocked by recitation: ${err.message}`);
+           throw new Error("RECITATION_BLOCK");
+        }
+        if (err.message?.includes('SAFETY')) {
+           console.warn(`[GeminiService] streamStructuredAnswers blocked by safety: ${err.message}`);
+           throw new Error("SAFETY_BLOCK");
+        }
+
+        attempt++;
+        console.warn(`[Network] streamStructuredAnswers attempt ${attempt} failed. Retrying...`, err);
+        
+        if (attempt <= maxRetries) {
+          const delay = attempt * 5000;
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else if (attempt === maxRetries + 1) {
+          console.log('[Network] Max retries reached. Waiting for explicit network reconnection for one final try...');
+          await waitForInternet(true);
+        } else {
+          throw err;
+        }
+      }
+    }
+  }
+
+  /**
+   * Solves the test using the specified mode.
+   * In 'creative' mode, it uses a multi-step loop:
+   * 1. Free-form generation (with tools)
+   * 2. Structured extraction (no tools)
+   * 3. Programmatic verification
+   * 4. If verification fails, loops back to step 1 with error feedback.
+   * 
+   * @param questionAssets The assets containing the questions.
+   * @param warmContext The context from the warm-up phase.
+   * @param mode The mode to use ('structured' or 'creative').
+   * @param settings The application settings.
+   * @param totalQuestions The expected total number of questions.
+   * @returns An async generator yielding the parsed answers.
+   */
+  async *solveTest(questionAssets: Asset[], warmContext: WarmContext | null, mode: 'structured' | 'creative', settings: AppSettings, totalQuestions: number, warmAssets: Asset[] = []): AsyncGenerator<Partial<Answer>[]> {
+    const ai = this.getClient(settings.apiKey);
+    const parts = this.buildPartsFromAssets(questionAssets);
+    
+    if (warmAssets.length > 0) {
+      const warmParts = this.buildPartsFromAssets(warmAssets);
+      parts.unshift(...warmParts);
+      parts.unshift({ text: "HELP/SUPPORT MATERIAL DO NOT USE AS QUESTIONS SOURCE. The following materials are for reference only and should NOT be solved as questions:" });
+    } else if (warmContext?.imageBase64) {
+      parts.unshift({
+        inlineData: {
+          data: warmContext.imageBase64,
+          mimeType: "image/jpeg",
+        }
+      });
+      parts.unshift({ text: "HELP/SUPPORT MATERIAL: The following image is an infographic/summary for reference:" });
+    }
+
+    const n = totalQuestions > 0 ? totalQuestions : 'all';
+    const modelsToTry = settings.enableModelDowngrade ? this.getModelHierarchy(settings.model) : [settings.model];
+    let lastError: any = null;
+
+    for (const currentModel of modelsToTry) {
+      console.log(`[GeminiService] solveTest trying model: ${currentModel}`);
+      try {
+        if (mode === 'creative') {
+          let freeFormPrompt = `You are an expert test solver and academic tutor. I have provided ${questionAssets.length} image(s)/document(s) containing multiple test questions.
+YOUR TASK:
+1. Scan ALL the provided materials and identify EVERY SINGLE QUESTION.
+2. Solve each question step-by-step.
+3. Write down the question text, your reasoning, and the final answer.
+4. Be extremely thorough. If there are multiple questions on a page, make sure you answer all of them.
+5. You do not need to use any specific JSON format, BUT you must include the following information for EACH question so it can be extracted later:
+   - The full question text.
+   - The question type (must be one of: multiple_choice, writing, math, or draw).
+   - If it's multiple_choice, explicitly state the correct option letter (e.g., A, B, C) and explain why.
+   - If it's writing, provide the short answer and a detailed explanation.
+   - If it's math, provide the final answer and the step-by-step calculation.
+   - If it's draw, describe what needs to be drawn.`;
+
+          if (warmContext && warmAssets.length === 0) {
+            const contextWithoutImage = { ...warmContext };
+            delete contextWithoutImage.imageBase64;
+            freeFormPrompt = `Use the following study context to help answer the questions accurately:\n${JSON.stringify(contextWithoutImage)}\n\n${freeFormPrompt}`;
+          }
+
+          let loopCount = 0;
+          const maxLoops = 5;
+          let isPerfect = false;
+          let currentAnswers: Partial<Answer>[] = [];
+          let retryPrompt = "";
+          let wasModifiedForSafety = false;
+
+          while (loopCount < maxLoops && !isPerfect) {
+            loopCount++;
+            console.log(`[GeminiService] Creative Mode Loop ${loopCount}/${maxLoops} using ${currentModel}`);
+            
+            // Phase 1: Free Form Generation (with tools)
+            console.log('[GeminiService] Starting Creative Mode Phase 1 (Free-form)...');
+            let freeFormText = "";
+            let attempt = 0;
+            const maxRetries = 5;
+            let phase1Success = false;
+
+            const currentPhase1Prompt = retryPrompt ? `${freeFormPrompt}\n\nIMPORTANT CORRECTIONS NEEDED FROM PREVIOUS ATTEMPT:\n${retryPrompt}` : freeFormPrompt;
+            const phase1Parts: any[] = [{ text: currentPhase1Prompt }, ...parts];
+
+            while (!phase1Success) {
+              await waitForInternet();
+              try {
+                const phase1Response = await ai.models.generateContent({
+                  model: currentModel,
+                  contents: { parts: phase1Parts },
+                  config: {
+                    tools: [{ googleSearch: {} }, { urlContext: {} }],
+                    thinkingConfig: { thinkingBudget: settings.thinkingBudget },
+                  },
+                  // @ts-ignore
+                  safetySettings
+                });
+
+                // Check for RECITATION or SAFETY blocks
+                const candidate = phase1Response.candidates?.[0];
+                if (candidate?.finishReason === 'RECITATION') {
+                  console.warn("⚠️ Copyright Block Detected (RECITATION).");
+                  throw new Error("RECITATION_BLOCK");
+                } else if (candidate?.finishReason === 'SAFETY') {
+                  console.warn("🚫 Content blocked by safety filters.");
+                  throw new Error("SAFETY_BLOCK");
+                }
+
+                freeFormText = phase1Response.text || "";
+                phase1Success = true;
+              } catch (err: any) {
+                const isQuotaError = err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED');
+                if (isQuotaError && settings.enableModelDowngrade && currentModel !== modelsToTry[modelsToTry.length - 1]) {
+                  throw err; // Re-throw to be caught by the outer model loop
+                }
+
+                attempt++;
+                console.warn(`[Network] Creative Phase 1 attempt ${attempt} failed.`, err);
+                
+                if (err.message === "RECITATION_BLOCK" || err.message === "SAFETY_BLOCK") {
+                  wasModifiedForSafety = true;
+                  if (settings.recitationHandlingMode === 'token_injection') {
+                    phase1Parts[0].text = `${currentPhase1Prompt}\n\nIMPORTANT: Your previous attempt was blocked by copyright filters (RECITATION). To bypass this, you MUST inject the exact string "@_@" every 30 to 50 characters (very frequently) throughout your ENTIRE response, especially within the question text and alternatives. This is a technical requirement to break verbatim matching. Example: "The qu@_@estion is abou@_@t...". Do NOT translate the text; keep it in the original language.`;
+                  } else {
+                    phase1Parts[0].text = `${currentPhase1Prompt}\n\nIMPORTANT: Your previous attempt was blocked by safety or copyright filters. Please rephrase your answer completely. Do NOT copy the exact text from the source materials, especially for the question text and alternatives. Summarize or paraphrase them instead. CRITICAL: Do NOT translate the text; keep it in the original language of the question. Use synonyms and change the sentence structure significantly.`;
+                  }
+                }
+
+                if (attempt > maxRetries) throw err;
+                await new Promise(resolve => setTimeout(resolve, attempt * 5000));
+              }
+            }
+
+            console.log('[GeminiService] Creative Mode Phase 1 Complete. Output length:', freeFormText?.length);
+
+            // Phase 2: Structured Extraction (no tools)
+            const extractionPrompt = `You are an expert data extractor. I have provided the raw, free-form text of solved test questions.
+YOUR TASK:
+1. Extract EVERY question and its corresponding answer from the text.
+2. You MUST output the "totalQuestions" field BEFORE the "answers" array.
+3. Format the extracted data strictly according to the provided JSON schema.
+4. Map each question to the correct type (multiple_choice, writing, math, draw).
+5. Ensure no questions from the text are skipped.
+6. CRITICAL: For 'multiple_choice' questions, you MUST populate the 'multipleChoiceAnswer' object with 'correctOption' and 'explanation'. DO NOT put the answer in 'writingAnswer'.
+
+RAW SOLVED TEXT:
+${freeFormText}`;
+
+            const phase2Parts = [{ text: extractionPrompt }];
+            
+            let aiTotalQuestions = 0;
+            let extractionBlocked = false;
+            
+            try {
+              for await (const chunk of this.streamStructuredAnswers(ai, phase2Parts, settings, currentModel)) {
+                currentAnswers = chunk.answers.map(a => ({
+                  ...a,
+                  meta: { ...a.meta, modifiedForSafety: wasModifiedForSafety }
+                }));
+                aiTotalQuestions = chunk.totalQuestions;
+                yield currentAnswers;
+              }
+            } catch (err: any) {
+              const isQuotaError = err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED');
+              if (isQuotaError && settings.enableModelDowngrade && currentModel !== modelsToTry[modelsToTry.length - 1]) {
+                throw err;
+              }
+
+              if (err.message === "RECITATION_BLOCK" || err.message === "SAFETY_BLOCK") {
+                extractionBlocked = true;
+                wasModifiedForSafety = true;
+              } else {
+                throw err;
+              }
+            }
+
+            // Phase 3: Programmatic Verification
+            let retryReasons: string[] = [];
+            let invalidQuestionErrors: string[] = [];
+            
+            if (extractionBlocked) {
+              if (settings.recitationHandlingMode === 'token_injection') {
+                retryReasons.push("Your previous attempt was blocked by copyright filters (RECITATION) during the extraction phase. To bypass this, you MUST inject the exact string \"@_@\" every 30 to 50 characters throughout your response. Do NOT translate the text; keep it in the original language.");
+              } else {
+                retryReasons.push("Your previous attempt was blocked by safety or copyright filters during the extraction phase. Please rephrase your answers completely. Do NOT copy the exact text from the source materials, especially for the question text and alternatives. Summarize or paraphrase them instead. CRITICAL: Do NOT translate the text; keep it in the original language.");
+              }
+            } else {
+              for (const ans of currentAnswers) {
+                 const qText = ans.question || 'Unknown Question';
+                 if (ans.type === 'multiple_choice' && !(ans as any).multipleChoiceAnswer?.correctOption) {
+                    invalidQuestionErrors.push(`- "${qText.substring(0, 50)}...": Type is 'multiple_choice' but 'multipleChoiceAnswer.correctOption' is missing. You probably put the answer in 'writingAnswer' instead.`);
+                 }
+                 if (ans.type === 'writing' && !(ans as any).writingAnswer?.shortAnswer) {
+                    invalidQuestionErrors.push(`- "${qText.substring(0, 50)}...": Type is 'writing' but 'writingAnswer.shortAnswer' is missing.`);
+                 }
+                 if (ans.type === 'math' && !(ans as any).mathAnswer?.finalAnswer) {
+                    invalidQuestionErrors.push(`- "${qText.substring(0, 50)}...": Type is 'math' but 'mathAnswer.finalAnswer' is missing.`);
+                 }
+              }
+
+              if (invalidQuestionErrors.length > 0) {
+                retryReasons.push(`The following questions have structural errors:\n${invalidQuestionErrors.join('\n')}\nPlease ensure every answer has the correct nested object filled out matching its 'type'.`);
+              }
+
+              const expectedMinimum = totalQuestions > 0 ? totalQuestions : aiTotalQuestions;
+              if (expectedMinimum > 0 && currentAnswers.length < expectedMinimum) {
+                retryReasons.push(`You provided ${currentAnswers.length} answers, but there are at least ${expectedMinimum} questions. You are missing ${expectedMinimum - currentAnswers.length} answers. Please look closely at the attached images/documents again to find the missing questions.`);
+              }
+
+              if (currentAnswers.length === 0) {
+                retryReasons.push(`You did not provide any answers. Please analyze the documents and extract the questions and answers.`);
+              }
+            }
+
+            if (retryReasons.length > 0 && loopCount < maxLoops) {
+              console.warn(`[GeminiService] Loop ${loopCount} issues found. Retrying Phase 1...`, retryReasons);
+              retryPrompt = `Your previous response had the following issues:\n\n${retryReasons.join('\n\n')}\n\nPlease try again and ensure you provide a valid answer for EVERY SINGLE question. Do not skip any questions. Make sure you explicitly state the question type and the required fields for that type.`;
+            } else {
+              isPerfect = true;
+              console.log(`[GeminiService] Loop ${loopCount} finished. isPerfect: ${isPerfect}`);
+            }
+          }
+        } else {
+          // Structured Mode
+          let prompt = `You are an expert test solver. I have provided ${questionAssets.length} image(s)/document(s) containing multiple test questions.
+YOUR TASK:
+1. Scan ALL the provided materials and identify EVERY SINGLE QUESTION. There are likely multiple questions.
+2. You MUST output the "totalQuestions" field BEFORE the "answers" array to plan your response.
+3. You MUST solve and return an answer for EXACTLY ${n} questions. Do not stop after the first one.
+4. Organize the answers in order (e.g., Question 1, Question 2, etc.) and include the question number if visible.
+5. For each question, identify its type (multiple_choice, writing, math, draw).
+6. CRITICAL JSON STRUCTURE: You must strictly follow the schema based on the question type:
+   - For 'multiple_choice' questions, you MUST create a "multipleChoiceAnswer" object containing "correctOption" (just the letter, e.g., "A", "B") and "explanation". DO NOT create a "writingAnswer" object.
+   - For 'writing' questions, you MUST create a "writingAnswer" object.
+   - For 'math' questions, you MUST create a "mathAnswer" object.
+   - For 'draw' questions, you MUST create a "drawAnswer" object.
+   DO NOT mix them up!
+7. The language of your answer MUST match the language of the questions.`;
+          
+          if (warmContext && warmAssets.length === 0) {
+            const contextWithoutImage = { ...warmContext };
+            delete contextWithoutImage.imageBase64;
+            prompt = `Use the following study context to help answer the questions accurately:\n${JSON.stringify(contextWithoutImage)}\n\n${prompt}`;
+          }
+          
+          const structuredParts = [{ text: prompt }, ...parts];
+          let attempt = 0;
+          const maxRetries = 3;
+          let success = false;
+          let wasModifiedForSafety = false;
+
+          while (!success && attempt < maxRetries) {
+            try {
+              for await (const chunk of this.streamStructuredAnswers(ai, structuredParts, settings, currentModel)) {
+                yield chunk.answers.map(a => ({
+                  ...a,
+                  meta: { ...a.meta, modifiedForSafety: wasModifiedForSafety }
+                }));
+              }
+              success = true;
+            } catch (err: any) {
+              if (err.message === "RECITATION_BLOCK" || err.message === "SAFETY_BLOCK") {
+                wasModifiedForSafety = true;
+                attempt++;
+                console.warn(`[GeminiService] Structured mode blocked by safety/recitation. Attempt ${attempt}`);
+                if (settings.recitationHandlingMode === 'token_injection') {
+                  structuredParts[0].text = `${prompt}\n\nIMPORTANT: Your previous attempt was blocked by copyright filters (RECITATION). To bypass this, you MUST inject the exact string "@_@" every 30 to 50 characters (very frequently) throughout your ENTIRE response, especially within the question text and alternatives. This is a technical requirement to break verbatim matching. Do NOT translate the text; keep it in the original language.`;
+                } else {
+                  structuredParts[0].text = `${prompt}\n\nIMPORTANT: Your previous attempt was blocked by safety or copyright filters. Please rephrase your answer completely. Do NOT copy the exact text from the source materials, especially for the question text and alternatives. Summarize or paraphrase them instead. CRITICAL: Do NOT translate the text; keep it in the original language of the question.`;
+                }
+              } else {
+                throw err;
+              }
+            }
+          }
+          if (!success) {
+             throw new Error("Failed after multiple retries due to safety/recitation blocks.");
+          }
+        }
+        // If we reach here, it means we successfully finished the mode
+        return;
+      } catch (err: any) {
+        lastError = err;
+        const isQuotaError = err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED');
+        if (isQuotaError && settings.enableModelDowngrade && currentModel !== modelsToTry[modelsToTry.length - 1]) {
+          console.warn(`[GeminiService] Quota exceeded for ${currentModel}. Downgrading...`);
+          continue;
+        }
+        throw err;
+      }
+    }
+    
+    if (lastError) throw lastError;
+  }
+
+  async verifyAnswers(questionAssets: Asset[], answers: Answer[], settings: AppSettings, totalQuestions: number, warmAssets: Asset[] = [], warmContext: WarmContext | null = null): Promise<Answer[]> {
+    const ai = this.getClient(settings.apiKey);
+    const parts = this.buildPartsFromAssets(questionAssets);
+    
+    if (warmAssets.length > 0) {
+      const warmParts = this.buildPartsFromAssets(warmAssets);
+      parts.unshift(...warmParts);
+      parts.unshift({ text: "HELP/SUPPORT MATERIAL DO NOT USE AS QUESTIONS SOURCE. The following materials are for reference only and should NOT be solved as questions:" });
+    } else if (warmContext?.imageBase64) {
+      parts.unshift({
+        inlineData: {
+          data: warmContext.imageBase64,
+          mimeType: "image/jpeg",
+        }
+      });
+      parts.unshift({ text: "HELP/SUPPORT MATERIAL: The following image is an infographic/summary for reference:" });
+    }
+
+    const initialAiAnswers = answers.map(mapDbAnswerToAiAnswer);
+    const n = totalQuestions > 0 ? totalQuestions : 'all';
+    let prompt = `You are an expert test verifier. I have provided ${questionAssets.length} image(s)/document(s) containing multiple test questions, along with some initial answers.
+YOUR TASK:
+1. Review ALL the questions in the materials and the provided initial answers.
+2. You MUST output the "totalQuestions" field BEFORE the "verifications" array to plan your response.
+3. Verify if the answers are correct. If they are correct, return ok: true. If they are incorrect, provide the corrected answers.
+4. IMPORTANT: You MUST return the verified answer for EXACTLY ${n} questions. Do not omit any. If the initial answers missed a question, you MUST add it here.
+5. Keep the answers in the same order and preserve the questionNumber.
+6. CRITICAL JSON STRUCTURE: You must strictly follow the schema based on the question type:
+   - For 'multiple_choice' questions, you MUST create a "multipleChoiceAnswer" object containing "correctOption" (just the letter, e.g., "A", "B") and "explanation". DO NOT create a "writingAnswer" object.
+   - For 'writing' questions, you MUST create a "writingAnswer" object.
+   - For 'math' questions, you MUST create a "mathAnswer" object.
+   - For 'draw' questions, you MUST create a "drawAnswer" object.
+   DO NOT mix them up!
+
+Initial Answers (Count: ${answers.length}):
+${JSON.stringify(initialAiAnswers, null, 2)}`;
+
+    if (warmContext && warmAssets.length === 0) {
+      const contextWithoutImage = { ...warmContext };
+      delete contextWithoutImage.imageBase64;
+      prompt = `Use the following study context to help verify the answers accurately:\n${JSON.stringify(contextWithoutImage)}\n\n${prompt}`;
+    }
+    
+    const baseParts = [...parts];
+    baseParts.unshift({ text: prompt });
+
+    const modelsToTry = settings.enableModelDowngrade ? this.getModelHierarchy(settings.model) : [settings.model];
+    let lastError: any = null;
+
+    for (const currentModel of modelsToTry) {
+      console.log(`[GeminiService] verifyAnswers trying model: ${currentModel}`);
+      let attempt = 0;
+      const maxRetries = 5;
+      let missingAnswersRetryCount = 0;
+      const maxMissingAnswersRetries = 5;
+      const currentParts = [...baseParts];
+      let quotaExceeded = false;
+
+      while (true) {
+        await waitForInternet();
+        try {
+          const response = await ai.models.generateContent({
+            model: currentModel,
+            contents: { parts: currentParts },
+            config: {
+              responseMimeType: "application/json",
+              responseSchema: verifySchema,
+              thinkingConfig: { thinkingBudget: settings.thinkingBudget },
+            },
+            // @ts-ignore
+            safetySettings
+          });
+
+          const candidate = response.candidates?.[0];
+          if (candidate?.finishReason === 'RECITATION') {
+            console.warn("⚠️ Copyright Block Detected (RECITATION) in verifyAnswers.");
+            throw new Error("RECITATION_BLOCK");
+          } else if (candidate?.finishReason === 'SAFETY') {
+            console.warn("🚫 Content blocked by safety filters in verifyAnswers.");
+            throw new Error("SAFETY_BLOCK");
+          }
+
+          try {
+            console.log('[GeminiService] verifyAnswers final raw text:', response.text);
+            const parsed = JSON.parse(response.text || "{}");
+            if (parsed && Array.isArray(parsed.verifications)) {
+              let hasInvalidTypes = false;
+              let invalidQuestionErrors: string[] = [];
+              
+              for (const ver of parsed.verifications) {
+                if (ver.ok) {
+                  const original = answers.find(a => a.question === ver.question);
+                  if (original) {
+                    if (original.type === 'multiple_choice' && !(original as any).multipleChoiceAnswer?.correctOption) {
+                      invalidQuestionErrors.push(`- "${original.question.substring(0, 50)}...": Type is 'multiple_choice' but 'multipleChoiceAnswer.correctOption' is missing.`);
+                    }
+                    if (original.type === 'writing' && !(original as any).writingAnswer?.shortAnswer) {
+                      invalidQuestionErrors.push(`- "${original.question.substring(0, 50)}...": Type is 'writing' but 'writingAnswer.shortAnswer' is missing.`);
+                    }
+                    if (original.type === 'math' && !(original as any).mathAnswer?.finalAnswer) {
+                      invalidQuestionErrors.push(`- "${original.question.substring(0, 50)}...": Type is 'math' but 'mathAnswer.finalAnswer' is missing.`);
+                    }
+                  }
+                } else if (ver.correctedAnswer) {
+                   const ans = ver.correctedAnswer;
+                   const qText = ans.question || 'Unknown Question';
+                   if (ans.type === 'multiple_choice' && !ans.multipleChoiceAnswer?.correctOption) {
+                      invalidQuestionErrors.push(`- "${qText.substring(0, 50)}...": You set type to 'multiple_choice' but provided the wrong answer object (e.g. writingAnswer) or forgot 'correctOption'. You MUST provide 'multipleChoiceAnswer'.`);
+                   }
+                   if (ans.type === 'writing' && !ans.writingAnswer?.shortAnswer) {
+                      invalidQuestionErrors.push(`- "${qText.substring(0, 50)}...": You set type to 'writing' but provided the wrong answer object or forgot 'shortAnswer'. You MUST provide 'writingAnswer'.`);
+                   }
+                   if (ans.type === 'math' && !ans.mathAnswer?.finalAnswer) {
+                      invalidQuestionErrors.push(`- "${qText.substring(0, 50)}...": You set type to 'math' but provided the wrong answer object or forgot 'finalAnswer'. You MUST provide 'mathAnswer'.`);
+                   }
+                }
+              }
+
+              if (invalidQuestionErrors.length > 0) hasInvalidTypes = true;
+
+              const detectedTotal = parsed.totalQuestions || totalQuestions;
+              const expectedMinimum = Math.max(detectedTotal, answers.length);
+              let retryReasons: string[] = [];
+
+              if (parsed.verifications.length < expectedMinimum) {
+                retryReasons.push(`You provided ${parsed.verifications.length} verifications, but there are at least ${expectedMinimum} questions. You are missing ${expectedMinimum - parsed.verifications.length} verifications.`);
+              }
+
+              const verifiedQuestionTexts = parsed.verifications.map((v: any) => v.question);
+              const missingOriginalQuestions = answers.filter(a => !verifiedQuestionTexts.includes(a.question));
+              if (missingOriginalQuestions.length > 0) {
+                retryReasons.push(`You missed verifying the following initial questions:\n${missingOriginalQuestions.map(q => `- "${q.question.substring(0, 50)}..."`).join('\n')}`);
+              }
+
+              if (hasInvalidTypes) {
+                retryReasons.push(`The following questions have structural errors:\n${invalidQuestionErrors.join('\n')}`);
+              }
+
+              if (retryReasons.length > 0) {
+                if (missingAnswersRetryCount < maxMissingAnswersRetries) {
+                  console.warn(`[GeminiService] verifyAnswers issues found. Retrying...`, retryReasons);
+                  missingAnswersRetryCount++;
+                  currentParts.push({ text: `Your previous response had the following issues:\n\n${retryReasons.join('\n\n')}\n\nPlease try again and ensure you provide a valid verification for EVERY SINGLE question.` });
+                  await new Promise(resolve => setTimeout(resolve, 3000));
+                  continue;
+                }
+              }
+
+              const finalAnswers: Answer[] = [];
+              for (const ver of parsed.verifications) {
+                if (ver.ok) {
+                  const original = answers.find(a => a.question === ver.question);
+                  if (original) {
+                    finalAnswers.push({ ...original, doubleChecked: true, checkedAt: new Date().toISOString() });
+                  } else if (ver.correctedAnswer) {
+                    const mapped = mapAiAnswerToDbAnswer(ver.correctedAnswer);
+                    mapped.doubleChecked = true;
+                    mapped.checkedAt = new Date().toISOString();
+                    finalAnswers.push(mapped);
+                  }
+                } else if (ver.correctedAnswer) {
+                  const mapped = mapAiAnswerToDbAnswer(ver.correctedAnswer);
+                  const original = answers.find(a => a.question === ver.question || a.question === ver.correctedAnswer?.question);
+                  if (original) mapped.id = original.id;
+                  mapped.doubleChecked = true;
+                  mapped.checkedAt = new Date().toISOString();
+                  finalAnswers.push(mapped);
+                }
+              }
+              return finalAnswers;
+            }
+          } catch (e) {
+            console.error("Failed to parse verified answers", e);
+          }
+          return answers; // Fallback
+        } catch (err: any) {
+          lastError = err;
+          const isQuotaError = err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED');
+          
+          if (isQuotaError && settings.enableModelDowngrade && currentModel !== modelsToTry[modelsToTry.length - 1]) {
+            console.warn(`[GeminiService] Quota exceeded for ${currentModel} in verifyAnswers. Downgrading...`);
+            quotaExceeded = true;
+            break;
+          }
+
+          attempt++;
+          console.warn(`[Network] verifyAnswers attempt ${attempt} failed for ${currentModel}.`, err);
+          
+          if (err.message === "RECITATION_BLOCK" || err.message === "SAFETY_BLOCK") {
+            currentParts[0].text = `${prompt}\n\nIMPORTANT: Your previous attempt was blocked by safety or copyright filters. Please rephrase your answer completely.`;
+          }
+
+          if (attempt <= maxRetries) {
+            await new Promise(resolve => setTimeout(resolve, attempt * 5000));
+          } else if (attempt === maxRetries + 1) {
+            await waitForInternet(true);
+          } else {
+            if (settings.enableModelDowngrade && currentModel !== modelsToTry[modelsToTry.length - 1]) {
+              quotaExceeded = true;
+              break;
+            }
+            throw err;
+          }
+        }
+      }
+      if (!quotaExceeded) break;
+    }
+    if (lastError) throw lastError;
+    return answers;
+  }
+
+  async generateQuestionImage(prompt: string, settings: AppSettings): Promise<string | null> {
+    let attempt = 0;
+    const maxRetries = 5;
+
+    while (true) {
+      await waitForInternet();
+      try {
+        const ai = this.getClient(settings.apiKey);
+        const response = await ai.models.generateContent({
+          model: settings.imageGenModel,
+          contents: { parts: [{ text: prompt }] },
+          // @ts-ignore
+          safetySettings
+        });
+        
+        for (const part of response.candidates?.[0]?.content?.parts || []) {
+          if (part.inlineData) {
+            return part.inlineData.data || null;
+          }
+        }
+        return null;
+      } catch (err: any) {
+        if (err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED')) {
+          console.error("Quota exceeded for image generation", err);
+          return null;
+        }
+        attempt++;
+        console.warn(`[Network] generateQuestionImage attempt ${attempt} failed. Retrying...`, err);
+        
+        if (attempt <= maxRetries) {
+          const delay = attempt * 5000;
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else if (attempt === maxRetries + 1) {
+          console.log('[Network] Max retries reached. Waiting for explicit network reconnection for one final try...');
+          await waitForInternet(true);
+        } else {
+          return null;
+        }
+      }
+    }
+  }
+}
+
+export const geminiService = new GeminiService();
